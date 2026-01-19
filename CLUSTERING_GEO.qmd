@@ -1,0 +1,772 @@
+---
+title: "UN ESTUDIO SOBRE EL RIESGO DE CONFLAGRACIÓN EN BARCELONA"
+description: "Máster en Ciencias Actuariales y Financieras"
+author:
+  - name: "Sergi López Vergara"
+    url: https://www.linkedin.com/in/sergivergaraeco/
+date: "---"
+format:
+  html:
+    page-layout: full
+    grid:
+      body-width: 1000px
+      sidebar-width: 150px
+      margin-width: 250px
+    toc: true
+    toc-depth: 3
+    toc-expand: true
+    toc-location: right
+    theme: cosmo
+    self-contained: true
+    include-in-header:
+      text: |
+        <style>
+        /* Contenedor Principal */
+        header#title-block-header {
+          text-align: center;
+          padding: 60px 0 30px 0;
+          background: #ffffff;
+          border-bottom: 3px solid #2c3e50;
+          margin-bottom: 50px;
+        }
+
+        /* Subtítulo (Máster) */
+        header#title-block-header .description p {
+          font-weight: 600;
+          color: #e67e22; /* Un naranja sutil o el color de tu uni */
+          text-transform: uppercase;
+          letter-spacing: 2px;
+          font-size: 0.9em;
+          margin-bottom: 15px;
+        }
+
+        h1.title {
+          font-weight: 850;
+          font-size: 3.2em !important;
+          color: #2c3e50;
+          margin-top: 0;
+        }
+
+        /* Rejilla de Metadatos: Nombre | LinkedIn | Fecha */
+        .quarto-title-meta {
+          display: grid;
+          grid-template-columns: 1fr 1fr 1fr;
+          gap: 20px;
+          border-top: 1px solid #eeeeee;
+          padding-top: 25px;
+          margin-top: 25px !important;
+        }
+
+        .quarto-title-meta-heading {
+          font-size: 0.7em;
+          color: #95a5a6;
+          text-transform: uppercase;
+          margin-bottom: 5px;
+        }
+
+        .quarto-title-meta-contents a {
+          color: #0077b5; /* Azul oficial de LinkedIn */
+          text-decoration: none;
+          font-weight: 600;
+        }
+
+        .quarto-title-meta-contents a:hover {
+          text-decoration: underline;
+        }
+
+        /* Mantener estilos de tablas y TOC anteriores */
+        .cell-output-display,
+        .cell-output-stdout {
+          display: flex;
+          justify-content: center;
+          margin: 2em 0;
+        }
+
+        table {
+          margin: auto !important;
+        }
+
+        #TOC {
+          padding-left: 20px;
+          border-left: 1px solid #2c3e50;
+        }
+        </style>
+
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+# Introducción
+
+El riesgo de **conflagración urbana** —la propagación de un incendio entre múltiples edificaciones— representa una de las amenazas más complejas para la solvencia de las entidades aseguradoras de multirriesgo hogar. A diferencia de los siniestros aislados, la conflagración genera una **correlación espacial extrema**, donde un único evento puede afectar a una acumulación crítica de capital asegurado.
+
+En el marco de **Solvencia II y el proceso ORSA**, las aseguradoras están obligadas a identificar y cuantificar estas acumulaciones de forma prospectiva. Sin embargo, los métodos tradicionales basados en radios fijos suelen ser insuficientes en entornos urbanos heterogéneos.
+
+Este trabajo tiene como objetivo desarrollar un modelo avanzado de detección de riesgos en la ciudad de **Barcelona**. Mediante el uso de algoritmos de *machine learning* espacial (**DBSCAN y HDBSCAN**), se identifican clusters de exposición real y se propone un **score geométrico original** que evalúa la peligrosidad tridimensional de la cartera (verticalidad en edificios y proximidad horizontal). El estudio busca transformar datos georreferenciados en una métrica de gestión que permita optimizar el control de acumulaciones y la estrategia de reaseguro de la entidad.
+
+# Librerias y Datos
+
+Para la realización del presente trabajo se ha hecho uso de diversas librerías del lenguaje **R**, orientadas al tratamiento y análisis de datos, así como al análisis espacial.
+
+```{r}
+#| echo: true
+#| results: 'hide'
+#| message: false
+#| warning: false
+
+
+library(knitr)
+library(scales)
+library(ggplot2)
+library(readr)
+library(leaflet)
+library(dplyr)
+library(tidyverse)
+library(sf)
+library(dbscan)
+set.seed(1234)
+```
+
+Los datos empleados proceden del siguiente conjunto de datos público:
+
+**Ajuntament de Barcelona** (2024). *Llista d'adreces dels edificis de la ciutat de Barcelona* \[Conjunto de datos\]. Oficina Municipal de Dades – Carto BCN. Recuperado de: <https://opendata-ajuntament.barcelona.cat/>
+
+Con el objetivo de simular el comportamiento de una cartera real de una entidad aseguradora, la base de datos original ha sido modificada mediante la introducción de variables adicionales, permitiendo la generación de una **cartera sintética** con características coherentes y realistas, adecuada para el desarrollo del ejercicio y el análisis del riesgo de conflagración.
+
+```{r}
+#| echo: true
+#| results: 'hide'
+#| message: false
+#| warning: false
+#| code-fold: true
+DF_BARCELONA <- read.csv("DF_BARCELONA.csv")
+df_polizas <- DF_BARCELONA %>%
+  filter(!is.na(codi_illa)) %>%
+  mutate(
+    densidad_barrio = case_when(
+      districte %in% c(2, 6) ~ "Alta",
+      districte %in% c(1, 3, 7) ~ "Media",
+      TRUE ~ "Baja"
+    ),
+    lambda_viviendas = recode(
+      densidad_barrio,
+      "Alta"  = 12,
+      "Media" = 8,
+      "Baja"  = 4
+    ),
+    n_viviendas = rpois(n(), lambda_viviendas) + 1
+  ) %>%
+  uncount(n_viviendas) %>%
+  group_by(codi_illa, numpost_i, nom_carrer) %>%
+  mutate(
+    puertas_por_planta = case_when(
+      densidad_barrio == "Alta"  ~ sample(3:4, 1),
+      densidad_barrio == "Media" ~ sample(2:3, 1),
+      TRUE                       ~ sample(1:2, 1)
+    ),
+    idx = row_number() - 1,
+    planta = (idx %/% puertas_por_planta) + 1,
+    puerta = (idx %% puertas_por_planta) + 1
+  ) %>%
+  ungroup() %>%
+  mutate(
+    tipo_valor_barrio = case_when(
+      nom_barri %in% c(
+        "Sarrià", "Sant Gervasi - Galvany",
+        "les Tres Torres", "Pedralbes",
+        "la Dreta de l'Eixample"
+      ) ~ "Alta",
+      nom_barri %in% c(
+        "Gràcia", "el Raval",
+        "Poble-sec", "Sant Antoni", "Sants"
+      ) ~ "Media",
+      
+      TRUE ~ "Baja"
+    ),
+    suma_asegurada = rlnorm(
+      n(),
+      meanlog = log(recode(
+        tipo_valor_barrio,
+        "Alta"  = 350000,
+        "Media" = 220000,
+        "Baja"  = 140000
+      )),
+      sdlog = recode(
+        tipo_valor_barrio,
+        "Alta"  = 0.35,
+        "Media" = 0.40,
+        "Baja"  = 0.45
+      )
+    )
+  )
+```
+
+A partir de la base de datos original, se ha procedido a la generación de un número variable de viviendas por dirección, en función de la densidad urbana del barrio en el que se ubican. En concreto, el número de viviendas por edificio se simula mediante una **distribución de Poisson**, cuyo parámetro depende de la densidad urbana del entorno, permitiendo introducir heterogeneidad en el número de pólizas asociadas a cada edificio y reproduciendo de forma razonable la estructura de una cartera real de seguros de hogar.
+
+Asimismo, se ha incorporado una variable de **suma asegurada**, simulada mediante una **distribución log-normal**, cuyos parámetros se ajustan en función del tipo de barrio. El uso de esta distribución aleatoria permite capturar la asimetría y la dispersión características del valor asegurado en seguros de hogar, así como reflejar las diferencias de valor inmobiliario existentes en la ciudad de Barcelona.
+
+Las viviendas generadas se han asignado de forma secuencial a **plantas y puertas dentro de cada edificio**, completando las viviendas disponibles en una planta antes de asignar viviendas a la planta superior.
+
+Finalmente, se selecciona una muestra aleatoria que represente una cartera de polizas de una entidad aseguradora, unas 30mil viviendas, y se eliminan las columnas que no son relevantes para el estudio.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+df <- df_polizas %>%
+  select(
+    x_etrs89,
+    y_etrs89,
+    codi_illa,
+    nom_carrer,
+    numpost_i,
+    planta,
+    puerta,
+    suma_asegurada,
+    nom_barri
+  ) %>%
+  filter(
+    !is.na(x_etrs89),
+    !is.na(y_etrs89)
+  ) %>%
+  sample_n(20000)
+str(df)
+```
+
+| Variable | Descripción |
+|----------------------|--------------------------------------------------|
+| `x_etrs89` | Coordenada X en el sistema de referencia ETRS89 / UTM (metros). Se utiliza para el cálculo de distancias y el clustering espacial. |
+| `y_etrs89` | Coordenada Y en el sistema de referencia ETRS89 / UTM (metros). Se utiliza para el cálculo de distancias y el clustering espacial. |
+| `codi_illa` | Identificador de la manzana catastral donde se ubica el edificio. Permite agrupar viviendas pertenecientes a un mismo entorno urbano. |
+| `nom_carrer` | Nombre de la vía pública en la que se localiza el edificio. Se emplea para la identificación e interpretación de los clusters. |
+| `numpost_i` | Número de portal del edificio dentro de la vía pública. Identifica la dirección postal del inmueble. |
+| `planta` | Número de planta en la que se sitúa la vivienda dentro del edificio. |
+| `puerta` | Identificador de la puerta dentro de la planta. Permite distinguir viviendas dentro de una misma planta. |
+| `suma_asegurada` | Valor asegurado de la vivienda. Representa la exposición económica al riesgo. |
+| `nom_barri` | Nombre del barrio en el que se ubica la vivienda. Variable contextual utilizada para la interpretación de los resultados. |
+
+# Clustering geográfico DBSCAN/HDBSCAN
+
+DBSCAN (Density-Based Spatial Clustering of Applications with Noise) es un algoritmo de *machine learning* no supervisado especialmente adecuado para la identificación de agrupaciones espaciales en datos georreferenciados. A diferencia de otros métodos de clustering, DBSCAN no requiere fijar a priori el número de clusters, sino que los identifica de forma endógena a partir de la densidad local de observaciones. Asimismo, permite controlar explícitamente la escala espacial del análisis mediante el parámetro de radio ε, lo que resulta especialmente conveniente en aplicaciones donde la distancia física entre observaciones tiene una interpretación directa.
+
+Otra ventaja relevante de DBSCAN es su capacidad para identificar observaciones aisladas como ruido, evitando forzar su asignación a un cluster, lo que resulta coherente con la naturaleza del riesgo de acumulación analizado. Estas características hacen de DBSCAN una herramienta idónea para detectar *hotspots* de riesgo de conflagración en entornos urbanos, donde la proximidad espacial entre pólizas constituye el principal factor de dependencia.
+
+Para el presente ejercicio se aplica el algoritmo DBSCAN con un radio de 30 metros y un número mínimo de tres pólizas para la formación de un cluster. Estos parámetros permiten identificar agrupaciones espaciales relevantes a escala urbana, capturando de forma adecuada posibles focos de acumulación de riesgo de conflagración sin generar clusters excesivamente amplios ni demasiado dispersos.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+db <- dbscan(
+  x = df[, c("x_etrs89", "y_etrs89")],
+  eps = 30,
+  minPts = 3
+)
+df$cluster_id <- db$cluster
+max(df$cluster_id)
+mean(df$cluster_id == 0)
+```
+
+El algoritmo ha detectado 2070 clusters, descartando como outlyers o puntos no clusterizables alrededor del 46.85% de las polizas.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+df <- df %>% filter(cluster_id > 0)
+cluster_sizes <- df %>%
+  filter(cluster_id > 0) %>%
+  count(cluster_id, name = "n_polizas")
+quantile(cluster_sizes$n_polizas, probs = c(0.5, 0.75, 0.9, 0.95, 0.99))
+
+```
+
+El análisis del tamaño de los clusters revela que la mayoría de las agrupaciones espaciales identificadas son de pequeña magnitud. La mediana del número de pólizas por cluster es de cuatro, y el 75 % de los clusters contiene 6 pólizas o menos. No obstante, la distribución presenta una cola derecha significativa, con un 1 % de clusters que supera las 25 pólizas, lo que pone de manifiesto la existencia de focos puntuales de elevada acumulación de riesgo, especialmente relevantes para el análisis de conflagración.
+
+A continuación se genera un mapa dianmico con la librería leaflet con **unicamente** los puntos clusterizados en el que se puede obvservar graficamente la forma y naturaleza de los cúmulos de exposición
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: true
+
+df_map <- df %>%
+  filter(cluster_id > 0) %>%
+  st_as_sf(
+    coords = c("x_etrs89", "y_etrs89"),
+    crs = 25831 
+  ) %>%
+  st_transform(4326)
+pal <- colorFactor(
+  palette = "Set3",
+  domain = df_map$cluster_id
+)
+
+leaflet(df_map) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  setView(
+    lng = 2.1734,   
+    lat = 41.3851,  
+    zoom = 12
+  ) %>%
+  addCircleMarkers(
+    radius = 3,
+    stroke = FALSE,
+    fillOpacity = 0.7,
+    color = ~pal(cluster_id)
+  )
+
+```
+
+El mapa representa la localización de las pólizas que han sido asignadas a algún cluster espacial, donde el color indica la pertenencia a cada cluster identificado por el algoritmo. Como puede observarse, en la gran mayoría de los casos el algoritmo segmenta adecuadamente las agrupaciones de pólizas. No obstante, en determinadas zonas de elevada densidad urbana se identifican clusters de gran extensión que abarcan áreas amplias, llegando en algunos casos a cubrir barrios completos. Este fenómeno pone de manifiesto una limitación inherente al uso de distancias euclídeas en entornos urbanos densos, donde la estructura viaria y la presencia de calles anchas actúan parcialmente como cortafuegos naturales que no quedan reflejados en una métrica puramente geométrica.
+
+Para matizar este efecto, se aplica el algoritmo **HDBSCAN** sobre aquellos clusters que superan las diez pólizas, los cuales representan aproximadamente el 8 % del total de agrupaciones identificadas. El objetivo es **refinar la segmentación mediante un enfoque basado en densidad jerárquica**, permitiendo desarticular macro-clusters.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: true
+
+clusters_grandes <- df %>%
+  filter(cluster_id > 0) %>%
+  count(cluster_id) %>%
+  filter(n > 10) %>%
+  pull(cluster_id)
+
+nuevo_id <- max(df$cluster_id) + 1
+for (cid in clusters_grandes) {
+  idx <- which(df$cluster_id == cid)
+  df_sub <- df[idx, ]
+  
+  hdb <- hdbscan(
+    df_sub[, c("x_etrs89", "y_etrs89")], 
+    minPts = 3
+  )
+  sub_clusters <- hdb$cluster
+  if (all(sub_clusters == 0)) next
+  if (any(sub_clusters == 0)) {
+    noise_idx <- which(sub_clusters == 0)
+    valid_idx <- which(sub_clusters > 0)
+    for (i in noise_idx) {
+      dist_to_valid <- sqrt(
+        (df_sub$x_etrs89[i] - df_sub$x_etrs89[valid_idx])^2 + 
+        (df_sub$y_etrs89[i] - df_sub$y_etrs89[valid_idx])^2
+      )
+      sub_clusters[i] <- sub_clusters[valid_idx[which.min(dist_to_valid)]]
+    }
+  }
+  for (sc in unique(sub_clusters)) {
+    df$cluster_id[idx[sub_clusters == sc]] <- nuevo_id
+    nuevo_id <- nuevo_id + 1
+  }
+}
+df %>%
+  filter(cluster_id > 0) %>%
+  count(cluster_id) %>%
+  summarise(
+    max_cluster = max(n),
+    q99 = quantile(n, 0.99)
+  )
+```
+
+Como podemos observar el algoritmo ha reducido los clusteres a menos de 13 polizas para el 99%.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: true
+
+df_map <- df %>%
+  filter(cluster_id > 0) %>%
+  group_by(cluster_id) %>% 
+  mutate(n_polizas = n()) %>% 
+  ungroup() %>%
+  st_as_sf(
+    coords = c("x_etrs89", "y_etrs89"),
+    crs = 25831 
+  ) %>%
+  st_transform(4326)
+
+set.seed(111) 
+n_clusters <- length(unique(df_map$cluster_id))
+colores_aleatorios <- sample(colors(), n_clusters, replace = TRUE)
+
+pal <- colorFactor(
+  palette = colores_aleatorios,
+  domain = df_map$cluster_id
+)
+
+leaflet(df_map) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  setView(
+    lng = 2.1734,   
+    lat = 41.3851,  
+    zoom = 13 
+  ) %>%
+  addCircleMarkers(
+    radius = 3,
+    stroke = FALSE,
+    fillOpacity = 0.8,
+    color = ~pal(cluster_id),
+    label = ~paste0("Cluster: ", cluster_id, " | Pólizas: ", n_polizas)
+  )
+```
+
+# Score de riesgo de conflagración
+
+Una vez identificadas las agrupaciones espaciales de pólizas mediante técnicas de clustering, el siguiente paso consiste en definir una métrica que permita aproximar el **riesgo de conflagración** desde un punto de vista geométrico y estructural. A diferencia de enfoques puramente agregados, el riesgo de conflagración urbana no reside en el cluster como una entidad homogénea, sino que emerge de la interacción entre **focos estructurales de riesgo** —los edificios— y su **proximidad espacial**.
+
+En consecuencia, el score de riesgo se construye siguiendo una lógica jerárquica en dos niveles:\
+(i) riesgo estructural dentro de cada edificación (referencia catastral), y\
+(ii) riesgo de interacción entre edificaciones próximas dentro de un mismo cluster.
+
+## Riesgo estructural intra-edificio
+
+Sea $b$ una referencia catastral (edificio) perteneciente a un cluster espacial $c$, que contiene $N_b$ pólizas. El edificio constituye la unidad básica de dependencia estructural, dado que la propagación de un incendio entre viviendas situadas en una misma edificación presenta una probabilidad significativamente superior a la existente entre edificaciones distintas.
+
+Para capturar este riesgo, se define una medida basada en la **interacción entre pares de pólizas** dentro del edificio. A cada póliza $i$ se le asigna una coordenada vertical:
+
+$$
+z_i = h_0 \cdot \text{planta}_i
+$$
+
+donde $h_0$ representa la altura media por planta, fijada en este trabajo en $h_0 = 3.5$ metros, valor representativo de edificación residencial urbana.
+
+La distancia vertical regularizada entre dos pólizas $i$ y $j$ del mismo edificio se define como:
+
+$$
+d_{ij}^{(b)} = 1 + \left| z_i - z_j \right|
+$$
+
+Esta formulación garantiza una distancia mínima estrictamente positiva incluso cuando ambas pólizas se encuentran en la misma planta, representando un escenario de contigüidad máxima.
+
+El **riesgo estructural del edificio** (b) se define entonces como:
+
+$$
+R_b = \sum_{i < j} \frac{1}{d_{ij}^{(b)}}
+$$
+
+Esta métrica presenta las siguientes propiedades deseables:
+
+-   Si $N_b = 1$, entonces $R_b = 0$.
+
+-   Si $N_b \geq 2$, el riesgo es estrictamente positivo.
+
+-   El riesgo crece de forma monótona con el número de pólizas.
+
+-   La separación en altura reduce, pero no elimina, la dependencia entre exposiciones.
+
+De este modo, se garantiza que la presencia de dos o más pólizas en un mismo edificio sea siempre más riesgosa que la existencia de una única póliza aislada.
+
+## Riesgo de interacción entre edificios
+
+Además del riesgo estructural propio de cada edificación, el riesgo de conflagración puede verse amplificado por la **proximidad entre edificios distintos**, especialmente en entornos urbanos densos. Para capturar este efecto, se introduce un término de interacción entre referencias catastrales dentro de un mismo cluster.
+
+Sea $d_{bb'}$ la distancia euclídea entre los centroides de dos edificios $b$ y $b'$. Se define una función de atenuación espacial:
+
+$$
+w_{b b'} = \frac{1}{1 + d_{b b'}^2}
+$$
+
+que penaliza de forma decreciente la interacción conforme aumenta la distancia entre edificaciones.
+
+Con el fin de distinguir entre el riesgo estructural interno de cada edificio y su contribución potencial como foco de propagación del incendio, se define la masa expuesta del edificio como:
+
+$$
+M_b = 1 + R_b
+$$
+
+El riesgo de interacción entre ambos edificios se define como:
+
+$$
+R_{bb'} = M_b \cdot M_{b'} \cdot w_{bb'}
+$$
+
+Esta formulación garantiza que:
+
+-   Un único edificio no genera riesgo de interacción.
+-   Dos edificios próximos generan un riesgo adicional positivo.
+-   La interacción aumenta con la concentración interna de pólizas en cada edificio.
+-   La distancia actúa como mecanismo de mitigación natural del riesgo.
+
+## Definición del score de riesgo del cluster
+
+El **score de riesgo de conflagración del cluster** $c$ se define finalmente como la suma del riesgo estructural de los edificios que lo componen y de los términos de interacción entre ellos:
+
+$$
+R_c = \sum_{b \in c} R_b + \sum_{b < b'} R_{b b'}
+$$
+
+Este score cumple propiedades fundamentales para el análisis del riesgo de conflagración:
+
+-   Es monótono respecto al número de pólizas y edificaciones.
+-   No presenta diluciones artificiales del riesgo al añadir nuevas exposiciones.
+-   Diferencia explícitamente entre riesgo estructural e interacción espacial.
+
+En consecuencia, el indicador propuesto constituye un proxy geométrico robusto de la peligrosidad potencial asociada a escenarios de conflagración urbana, adecuado para su posterior análisis conjunto con la severidad económica y su uso en contextos de gestión de acumulaciones.
+
+# Análisis
+
+A continuación se implementa el score de riesgo de conflagración propuesto, incorporando el riesgo estructural intra-edificio y los términos de interacción espacial entre edificaciones dentro de cada cluster.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+h0 <- 3.5
+df <- df %>%
+  mutate(
+    z = h0 * planta
+  )
+
+calc_Rb <- function(z) {
+  n <- length(z)
+  if (n < 2) return(0)
+  dist_mat <- abs(outer(z, z, "-"))
+  dist_mat <- 1 + dist_mat
+  sum(1 / dist_mat[upper.tri(dist_mat)])
+}
+Rb_df <- df %>%
+  group_by(cluster_id, codi_illa) %>%
+  summarise(
+    R_b = calc_Rb(z),
+    M_b = 1 + R_b,
+    x_b = mean(x_etrs89),
+    y_b = mean(y_etrs89),
+    .groups = "drop"
+  )
+calc_R_inter <- function(df_b) {
+  n <- nrow(df_b)
+  if (n < 2) return(0)
+  R <- 0
+  for (i in 1:(n - 1)) {
+    for (j in (i + 1):n) {
+      d <- sqrt(
+        (df_b$x_b[i] - df_b$x_b[j])^2 +
+        (df_b$y_b[i] - df_b$y_b[j])^2
+      )
+      w <- 1 / (1 + d^2)
+      R <- R + df_b$M_b[i] * df_b$M_b[j] * w
+    }
+  }
+  R
+}
+cluster_score <- Rb_df %>%
+  group_by(cluster_id) %>%
+  summarise(
+    R_intra = sum(R_b),
+    R_inter = calc_R_inter(cur_data()),
+    R_c = R_intra + R_inter,
+    .groups = "drop"
+  )
+```
+
+Dado que el score geométrico constituye un indicador puramente relativo de peligrosidad física, se opta por una clasificación de los clusters en función de percentiles del score. Esta aproximación permite analizar la distribución del capital asegurado a lo largo de distintos niveles de riesgo, evitando la introducción de supuestos adicionales sobre la combinación funcional entre peligrosidad y severidad económica.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+
+exposure_cluster <- df %>%
+  group_by(cluster_id) %>%
+  summarise(
+    exposure = sum(suma_asegurada),
+    .groups = "drop"
+  )
+cluster_risk <- cluster_score %>%
+  left_join(exposure_cluster, by = "cluster_id")
+
+cluster_risk <- cluster_risk %>%
+  mutate(
+    score_percentil = percent_rank(R_c) * 100
+  )
+cluster_risk <- cluster_risk %>%
+  mutate(
+    riesgo_clase = case_when(
+      score_percentil < 20 ~ "Muy bajo",
+      score_percentil < 40 ~ "Bajo",
+      score_percentil < 60 ~ "Medio",
+      score_percentil < 80 ~ "Alto",
+      score_percentil < 95 ~ "Muy alto",
+      TRUE ~ "Crítico"
+    )
+  )
+capital_por_clase <- cluster_risk %>%
+  group_by(riesgo_clase) %>%
+  summarise(
+    n_clusters = n(),
+    capital_total = sum(exposure),
+    capital_medio = mean(exposure),
+    .groups = "drop"
+  )
+
+```
+
+## Exploración
+
+En la siguiente Figura se representa la relación entre el **score geométrico de riesgo** y el **capital asegurado agregado por cluster**. El eje horizontal muestra el valor del score, que actúa como proxy de la peligrosidad geométrica del evento, mientras que el eje vertical recoge la suma asegurada total asociada a cada cluster, como medida de la severidad económica potencial.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: true
+
+ggplot(cluster_risk, aes(x = R_c, y = exposure)) +
+  geom_point(alpha = 0.6, size = 2) +
+  scale_x_log10() +
+  scale_y_log10(
+    labels = label_number(big.mark = ".", decimal.mark = ",")
+  ) +
+  labs(
+    x = "Score geométrico de riesgo",
+    y = "Capital asegurado por cluster",
+    title = "Riesgo geométrico vs capital asegurado por cluster"
+  ) +
+  theme_minimal()
+
+```
+
+Como puede observarse, existe una relación positiva entre el capital asegurado agregado por cluster y el score geométrico de riesgo. A medida que aumenta la exposición económica, el score tiende a incrementarse, lo que refleja que los clusters con mayor capital asegurado suelen corresponderse con agrupaciones que concentran un mayor número de pólizas en un espacio reducido. Este comportamiento es consistente con la definición del score, ya que el incremento del capital asegurado suele venir acompañado de una mayor densidad estructural de viviendas aseguradas, capturada por la geometría del cluster.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: true
+
+p90_score <- quantile(cluster_risk$R_c, 0.9)
+ggplot(
+  cluster_risk %>% filter(R_c >= p90_score),
+  aes(x = R_c, y = exposure)
+) +
+  geom_point(alpha = 0.7, size = 2) +
+  scale_x_log10() +
+  scale_y_log10(
+    labels = function(x) format(x, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+  ) +
+  labs(
+    x = "Score geométrico de riesgo (≥ P90)",
+    y = "Capital asegurado por cluster",
+    title = "Clusters con score geométrico por encima del percentil 90"
+  ) +
+  theme_minimal()
+
+
+```
+
+La nube resultante pone de manifiesto que una proporción significativa de estos clusters de alto riesgo concentra niveles relevantes de exposición económica, observándose numerosos casos que superan los tres millónes de euros de capital asegurado. Destaca, asimismo, la presencia de un número reducido de clusters que combinan valores extremos del score con acumulaciones económicas elevadas, configurando escenarios prioritarios desde el punto de vista de la gestión del riesgo de conflagración.
+
+A continuación un mapeado del 10% de los clusters con mayor riesgo:
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: true
+
+clusters_p90 <- cluster_risk %>%
+  filter(R_c >= p90_score) %>%
+  pull(cluster_id)
+
+df_map_p90 <- df %>%
+  filter(cluster_id %in% clusters_p90) %>%
+  group_by(cluster_id) %>%
+  mutate(
+    n_polizas = n()
+  ) %>%
+  ungroup() %>%
+  st_as_sf(
+    coords = c("x_etrs89", "y_etrs89"),
+    crs = 25831
+  ) %>%
+  st_transform(4326)
+
+pal <- colorFactor(
+  palette = colors(),
+  domain = df_map_p90$cluster_id
+)
+
+leaflet(df_map_p90) %>%
+  addProviderTiles(providers$CartoDB.Positron) %>%
+  setView(
+    lng = 2.1734,
+    lat = 41.3851,
+    zoom = 13
+  ) %>%
+  addCircleMarkers(
+    radius = 4,
+    stroke = FALSE,
+    fillOpacity = 0.8,
+    color = ~pal(cluster_id),
+    label = ~paste0(
+      "Cluster: ", cluster_id,
+      " | Pólizas: ", n_polizas
+    )
+  )
+
+```
+
+Los valores más elevados del score geométrico se asocian a clusters caracterizados por una fuerte concentración estructural de pólizas, tanto dentro de las edificaciones como entre edificios próximos, lo que incrementa de forma significativa el potencial de conflagración.
+
+La siguiente tabla recoge los clusters clasificados como críticos según el score geométrico de riesgo, junto con su capital asegurado agregado. Estos clusters representan escenarios prioritarios desde el punto de vista de la gestión del riesgo de conflagración, al combinar una elevada peligrosidad geométrica con una exposición económica relevante.
+
+```{r}
+#| echo: true
+#| message: false
+#| warning: false
+#| code-fold: true
+
+cluster_risk %>%
+  filter(riesgo_clase == "Crítico") %>%
+  select(
+    cluster_id,
+    R_c,
+    score_percentil,
+    exposure
+  ) %>%
+  arrange(desc(R_c)) %>%
+  mutate(
+    R_c = format(round(R_c, 2), nsmall = 2, big.mark = ".", decimal.mark = ","),
+    score_percentil = format(round(score_percentil, 2), nsmall = 2, big.mark = ".", decimal.mark = ","),
+    exposure = scales::label_number(
+      big.mark = ".", 
+      decimal.mark = ",", 
+      accuracy = 1
+    )(exposure)
+  ) %>%
+  kable(
+    col.names = c("Cluster", "Score geométrico", "Percentil", "Capital asegurado (€)"),
+    align = "lrrr",
+    caption = "Clusters críticos"
+  )
+```
+
+# Conclusiones
+
+El presente estudio ha permitido desarrollar y aplicar una metodología avanzada para la identificación y cuantificación del riesgo de conflagración en la ciudad de Barcelona, integrando técnicas de *machine learning* espacial con una métrica de riesgo estructural y de interacción.
+
+**Análisis de la segmentación espacial y el comportamiento del score**
+
+La combinación de algoritmos ha demostrado ser una herramienta robusta para la gestión de carteras de seguros. Mientras que el DBSCAN inicial identificó los núcleos de acumulación primaria, el refinamiento mediante HDBSCAN resultó crítico para corregir el fenómeno de los "macro-clusters" en zonas de alta densidad como el Eixample o Ciutat Vella. Esta segmentación jerárquica permite una identificación de focos de riesgo mucho más precisa, evitando que la continuidad urbana diluya la visibilidad de los cúmulos de exposición específicos.
+
+Sobre esta base, la métrica propuesta resuelve una limitación común en el análisis de acumulaciones al no tratar todos los puntos de un cluster por igual. Al diferenciar entre el riesgo estructural intra-edificio (verticalidad y contigüidad) y el riesgo de interacción entre edificios (proximidad horizontal), se valida que el riesgo no es solo una cuestión de volumen de pólizas, sino de su disposición tridimensional. La inclusión de la altura media por planta ($h_0$) permite capturar la realidad de la vivienda vertical en Barcelona, donde la probabilidad de propagación ascendente de un incendio es un factor técnico ineludible.
+
+**Correlación de exposición e implicaciones para la gestión**
+
+El análisis revela una clara correlación positiva entre el score geométrico y el capital asegurado. No obstante, la detección de clusters críticos por encima del percentil 95 pone de manifiesto que el riesgo de conflagración está altamente concentrado. Un número reducido de agrupaciones espaciales representa una amenaza desproporcionada para la solvencia de la entidad, con acumulaciones que superan los tres millones de euros en áreas geográficas muy reducidas.
+
+Desde una perspectiva actuarial y de supervisión, los resultados de este modelo proporcionan un marco técnico para la optimización del reaseguro, permitiendo definir con mayor precisión la prioridad y capacidad de los contratos de exceso de pérdida. Asimismo, facilita la suscripción selectiva mediante el establecimiento de límites de aceptación en zonas donde el score de interacción ya se encuentra en niveles críticos.
+
+### Recomendaciones para Futuros Estudios
+
+Para potenciar este modelo, se sugiere la inclusión de variables de vulnerabilidad constructiva (año de construcción, materiales) y la presencia de barreras naturales o viales (anchura de calles) como factores de atenuación en la función de interacción espacial ($w_{bb'}$). Así como cruzar la geometría con modelos de probabilidad de incendio.
